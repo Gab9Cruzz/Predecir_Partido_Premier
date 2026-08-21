@@ -1,5 +1,5 @@
-datos/cache/
 __pycache__/
 *.pyc
 .venv/
 venv/
+BD_SQLITE/*.db

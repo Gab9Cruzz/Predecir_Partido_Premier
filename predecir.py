@@ -1,12 +1,17 @@
 #!/usr/bin/env python
-"""Predictor de partidos de futbol.
+"""Predictor de partidos de Premier League.
 
 Uso rapido:
-    python predecir.py ligas
-    python predecir.py partido --liga SP1 --local Barcelona --visitante "Real Madrid"
-    python predecir.py proximos --liga SP1
-    python predecir.py ratings --liga SP1
-    python predecir.py backtest --liga SP1
+    python predecir.py equipos
+    python predecir.py partido --local Arsenal --visitante Chelsea
+    python predecir.py proximos
+    python predecir.py ratings
+    python predecir.py backtest
+
+Todos los datos -- historico y proximos partidos -- salen de la base local
+en BD_SQLITE/futbol_predicciones.db. Nada en este archivo descarga CSV en
+vivo: eso es trabajo de BD_SQLITE/cargar_datos.py y
+BD_SQLITE/actualizar_resultados.py, que se corren aparte.
 """
 
 from __future__ import annotations
@@ -14,11 +19,20 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
 import numpy as np
 
+# equipos_premier.py vive en BD_SQLITE/, fuera del paquete futbol/ (es el
+# catalogo que usan los scripts de ingesta). Se importa por path en vez de
+# mover el archivo, para no tocar los imports de cargar_datos.py /
+# actualizar_resultados.py, que ya funcionan.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "BD_SQLITE"))
+import equipos_premier  # noqa: E402
+
 from futbol.backtest import ejecutar as ejecutar_backtest, optimizar_xi
-from futbol.fuentes import footballdata_uk as fuente
+from futbol.fuentes import bd_local
+from futbol.fuentes.base import equipos_de
 from futbol.modelo.dixon_coles import (
     REGULARIZACION_POR_DEFECTO,
     XI_POR_DEFECTO,
@@ -34,19 +48,18 @@ from futbol.modelo.mercado import (
 
 BARRA = "=" * 68
 
+# Liga que efectivamente se predice. Championship (E1) se carga junto con
+# esta solo para darle conectividad al grafo de partidos -- ver bd_local.py.
+LIGA_PREDICCION = "E0"
+
 
 # --------------------------------------------------------------------- helpers
 
 def _cargar_modelo(args) -> tuple[DixonColes, list]:
-    codigos = [c.strip().upper() for c in args.liga.split(",") if c.strip()]
-    if len(codigos) > 1:
-        print("Cargando datos...")
-    partidos = fuente.cargar_varias(
-        codigos, temporadas=args.temporadas, forzar=args.actualizar,
-        verboso=len(codigos) > 1,
-    )
+    partidos = bd_local.cargar_para_ajuste()
     if not partidos:
-        print(f"No hay datos para {args.liga}. Prueba con --temporadas mayor.")
+        print("No hay datos en la base local. Corre 'python BD_SQLITE/init_db.py' "
+              "y 'python BD_SQLITE/cargar_datos.py' primero.")
         sys.exit(1)
 
     modelo = DixonColes(xi=args.xi, regularizacion=args.regularizacion)
@@ -133,38 +146,38 @@ def _comparar_con_mercado(pred: Prediccion, cuotas: tuple,
 
 # -------------------------------------------------------------------- comandos
 
-def cmd_ligas(args) -> None:
-    print("\nLigas disponibles (football-data.co.uk, gratis y sin API key)\n")
-    print(f"  {'cod':<5}{'pais':<12}{'liga':<24}{'datos'}")
-    print("  " + "-" * 62)
-    for liga in fuente.LIGAS.values():
-        extras = ("historico completo + cuotas" if liga.formato == "extra"
-                  else "cuotas + tiros, corners y tarjetas")
-        print(f"  {liga.codigo:<5}{liga.pais:<12}{liga.nombre:<24}{extras}")
-    print("\n  Puedes combinar varias con coma: --liga E0,E1")
-    print("  Los datos llegan hasta hace uno o dos dias.\n")
-
-
 def cmd_equipos(args) -> None:
-    partidos = fuente.cargar_varias(
-        [c.strip().upper() for c in args.liga.split(",")],
-        temporadas=args.temporadas, forzar=args.actualizar, verboso=False,
-    )
-    equipos = fuente.equipos_de(partidos)
-    print(f"\n{len(equipos)} equipos en {args.liga.upper()} "
-          f"(ultimas {args.temporadas} temporadas):\n")
+    partidos = bd_local.cargar_para_ajuste()
+    equipos = equipos_de(partidos)
+    print(f"\n{len(equipos)} equipos en la base local "
+          f"(Premier League + Championship, todo el historico):\n")
     for i in range(0, len(equipos), 3):
         print("   " + "".join(f"{e:<26}" for e in equipos[i:i + 3]))
-    print()
+    print("\nCualquiera de estos vale para --local/--visitante en 'partido' -- "
+          "incluidos los que hoy juegan en Championship (util para equipos "
+          "recien descendidos, o simple curiosidad).\n")
+
+
+def _resolver_via_catalogo(nombre: str) -> str:
+    """Si 'nombre' matchea el catalogo (oficial, corto, o codigo de 3 letras),
+    devuelve el nombre exacto del dataset. Si no, devuelve 'nombre' tal cual
+    -- el fuzzy-matching de base.py sigue siendo el fallback normal.
+
+    Existe porque el nombre oficial completo (ej. "Manchester City") no
+    siempre matchea el fuzzy-matcher generico contra el nombre corto del CSV
+    (ej. "Man City") -- "Manchester" y "Man" no comparten token ni superan
+    el umbral de similitud.
+    """
+    resuelto = equipos_premier.resolver_a_nombre_en_datos(nombre)
+    return resuelto if resuelto else nombre
 
 
 def cmd_partido(args) -> None:
     modelo, _ = _cargar_modelo(args)
     cuotas = tuple(args.cuotas) if args.cuotas else None
-    codigos = [c.strip().upper() for c in args.liga.split(",")]
     pred = modelo.predecir(
-        args.local, args.visitante,
-        liga=codigos[0] if len(codigos) == 1 else None,
+        _resolver_via_catalogo(args.local), _resolver_via_catalogo(args.visitante),
+        liga=LIGA_PREDICCION,
         campo_neutral=args.neutral,
     )
     if args.json:
@@ -204,89 +217,72 @@ def cmd_ratings(args) -> None:
 
 
 def cmd_proximos(args) -> None:
-    codigos = [c.strip().upper() for c in args.liga.split(",")] if args.liga else None
-    proximos = fuente.cargar_proximos(codigos)
+    proximos = bd_local.cargar_proximos()
     if not proximos:
-        print("\nNo hay partidos proximos publicados ahora mismo para esa seleccion.")
-        print("El archivo de proximos partidos cubre solo los siguientes dias.\n")
+        print("\nNo hay proximos partidos en la base. Corre "
+              "'python BD_SQLITE/actualizar_resultados.py' para traerlos "
+              "(sincroniza resultados Y proximos partidos).\n")
         return
 
-    por_liga: dict[str, list] = {}
+    modelo, _ = _cargar_modelo(args)
+
+    print(f"\n{len(proximos)} proximos partidos de Premier League\n")
+    print(BARRA)
+    print(f"  Premier League (Inglaterra)")
+    print(BARRA)
+    print(f"{'fecha':<12}{'partido':<40}{'1':>7}{'X':>7}{'2':>7}{'  xG':>10}")
+    print("-" * 84)
+
+    con_valor = []
+    sin_historico: list[str] = []
     for p in proximos:
-        por_liga.setdefault(p.liga, []).append(p)
-
-    print(f"\n{len(proximos)} partidos proximos en {len(por_liga)} liga(s)\n")
-
-    for codigo, lista in sorted(por_liga.items()):
-        historico = fuente.cargar(codigo, temporadas=args.temporadas,
-                                  forzar=args.actualizar, verboso=False)
         try:
-            modelo = DixonColes(xi=args.xi,
-                                regularizacion=args.regularizacion).ajustar(historico)
-        except ValueError as exc:
-            print(f"{fuente.LIGAS[codigo].nombre}: sin datos suficientes ({exc})")
+            pred = modelo.predecir(p.local, p.visitante, liga=LIGA_PREDICCION)
+        except KeyError:
+            sin_historico.append(f"{p.local} vs {p.visitante}")
             continue
+        enfrentamiento = f"{pred.local} vs {pred.visitante}"
+        # Un equipo con pocos partidos tiene el rating muy encogido: sus
+        # probabilidades son poco de fiar y generan falsos "valores".
+        poca_muestra = min(pred.partidos_local, pred.partidos_visitante) < 10
+        marca = " *" if poca_muestra else ""
+        print(f"{str(p.fecha):<12}{(enfrentamiento + marca)[:39]:<40}"
+              f"{pred.prob_local:>7.1%}{pred.prob_empate:>7.1%}"
+              f"{pred.prob_visitante:>7.1%}"
+              f"{pred.goles_esperados_local:>6.2f}-"
+              f"{pred.goles_esperados_visitante:.2f}")
+        if p.tiene_cuotas and not poca_muestra:
+            cuotas = (p.cuota_local, p.cuota_empate, p.cuota_visitante)
+            evs = [valor_esperado(pred.probs[k], cuotas[k]) for k in range(3)]
+            mejor = int(np.argmax(evs))
+            if evs[mejor] >= 0.05:
+                con_valor.append((enfrentamiento, ["1", "X", "2"][mejor],
+                                  cuotas[mejor], evs[mejor], pred.probs[mejor]))
 
-        print(BARRA)
-        print(f"  {fuente.LIGAS[codigo].nombre} ({fuente.LIGAS[codigo].pais})")
-        print(BARRA)
-        print(f"{'fecha':<12}{'partido':<40}{'1':>7}{'X':>7}{'2':>7}{'  xG':>10}")
-        print("-" * 84)
+    if sin_historico:
+        print(f"\n  Sin historico suficiente: {', '.join(sin_historico)}")
+    if con_valor:
+        print(f"\n  Donde mas discrepa el modelo del mercado:")
+        for enf, signo, cuota, ev, prob in sorted(con_valor, key=lambda x: -x[3])[:5]:
+            print(f"    {enf[:38]:<40} {signo}  cuota {cuota:.2f}  "
+                  f"modelo {prob:.1%}  EV {ev:+.1%}")
 
-        con_valor = []
-        sin_historico: list[str] = []
-        hay_poca_muestra = False
-        for p in lista:
-            try:
-                pred = modelo.predecir(p.local, p.visitante, liga=codigo)
-            except KeyError:
-                sin_historico.append(f"{p.local} vs {p.visitante}")
-                continue
-            # Uso los nombres ya resueltos: el archivo de proximos partidos
-            # escribe algunos equipos distinto que el de resultados.
-            enfrentamiento = f"{pred.local} vs {pred.visitante}"
-            # Un equipo con pocos partidos tiene el rating muy encogido: sus
-            # probabilidades son poco de fiar y generan falsos "valores".
-            poca_muestra = min(pred.partidos_local, pred.partidos_visitante) < 10
-            marca = " *" if poca_muestra else ""
-            print(f"{str(p.fecha):<12}{(enfrentamiento + marca)[:39]:<40}"
-                  f"{pred.prob_local:>7.1%}{pred.prob_empate:>7.1%}"
-                  f"{pred.prob_visitante:>7.1%}"
-                  f"{pred.goles_esperados_local:>6.2f}-"
-                  f"{pred.goles_esperados_visitante:.2f}")
-            if poca_muestra:
-                hay_poca_muestra = True
-            if p.tiene_cuotas and not poca_muestra:
-                cuotas = (p.cuota_local, p.cuota_empate, p.cuota_visitante)
-                evs = [valor_esperado(pred.probs[k], cuotas[k]) for k in range(3)]
-                mejor = int(np.argmax(evs))
-                if evs[mejor] >= 0.05:
-                    con_valor.append((enfrentamiento, ["1", "X", "2"][mejor],
-                                      cuotas[mejor], evs[mejor], pred.probs[mejor]))
-
-        if con_valor:
-            print(f"\n  Donde mas discrepa el modelo del mercado:")
-            for enf, signo, cuota, ev, prob in sorted(con_valor, key=lambda x: -x[3])[:5]:
-                print(f"    {enf[:38]:<40} {signo}  cuota {cuota:.2f}  "
-                      f"modelo {prob:.1%}  EV {ev:+.1%}")
-        print()
-
-    print("Recuerda: en el backtest el mercado acierta mas que el modelo.")
+    print("\nRecuerda: en el backtest el mercado acierta mas que el modelo.")
     print("Estas discrepancias son puntos a revisar, no recomendaciones.\n")
 
 
 def cmd_backtest(args) -> None:
-    codigos = [c.strip().upper() for c in args.liga.split(",")]
-    partidos = fuente.cargar_varias(codigos, temporadas=args.temporadas,
-                                    forzar=args.actualizar, verboso=True)
-    print(f"\nBacktest walk-forward sobre {len(partidos)} partidos "
+    partidos = bd_local.cargar_para_ajuste()
+    print(f"\nBacktest walk-forward sobre {len(partidos)} partidos cargados "
           f"({partidos[0].fecha} -> {partidos[-1].fecha})")
+    print("Se entrena con Premier League + Championship (conectividad), pero "
+          "solo se puntua Premier League -- es la unica liga que se predice.")
     print(f"xi={args.xi}  regularizacion={args.regularizacion}  "
           f"reajuste cada {args.refit} dias\n")
     resultado = ejecutar_backtest(
         partidos, xi=args.xi, regularizacion=args.regularizacion,
         dias_minimos=args.dias_minimos, refit_cada_dias=args.refit,
-        umbral_ev=args.umbral_ev,
+        umbral_ev=args.umbral_ev, evaluar_ligas={LIGA_PREDICCION},
     )
     print()
     print(resultado.texto())
@@ -294,19 +290,19 @@ def cmd_backtest(args) -> None:
 
 
 def cmd_optimizar(args) -> None:
-    codigos = [c.strip().upper() for c in args.liga.split(",")]
-    partidos = fuente.cargar_varias(codigos, temporadas=args.temporadas,
-                                    forzar=args.actualizar, verboso=True)
-    print(f"\nBuscando el mejor factor de olvido temporal para {args.liga.upper()}")
+    partidos = bd_local.cargar_para_ajuste()
+    print("\nBuscando el mejor factor de olvido temporal para Premier League")
     print("(cada linea es un backtest completo; tarda un rato)\n")
     mejor, _ = optimizar_xi(partidos, dias_minimos=args.dias_minimos,
-                            refit_cada_dias=max(args.refit, 14))
+                            refit_cada_dias=max(args.refit, 14),
+                            evaluar_ligas={LIGA_PREDICCION})
     semivida = np.log(2) / mejor if mejor > 0 else float("inf")
-    print(f"\nMejor xi para esta liga: {mejor}"
-          f"  (semivida {semivida:.0f} dias)" if mejor > 0
-          else f"\nMejor xi para esta liga: {mejor} (sin olvido temporal)")
-    print(f"Usalo asi:  python predecir.py partido --liga {args.liga} "
-          f"--xi {mejor} --local ... --visitante ...\n")
+    if mejor > 0:
+        print(f"\nMejor xi: {mejor}  (semivida {semivida:.0f} dias)")
+    else:
+        print(f"\nMejor xi: {mejor} (sin olvido temporal)")
+    print(f"Usalo asi:  python predecir.py partido --xi {mejor} "
+          f"--local ... --visitante ...\n")
 
 
 # ----------------------------------------------------------------------- main
@@ -314,35 +310,26 @@ def cmd_optimizar(args) -> None:
 def construir_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="predecir.py",
-        description="Predice resultados de futbol con un modelo Dixon-Coles "
-                    "sobre datos gratuitos y actualizados.",
+        description="Predice resultados de Premier League con un modelo "
+                    "Dixon-Coles sobre la base de datos local.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     sub = p.add_subparsers(dest="comando", required=True)
 
-    def comunes(sp, con_liga=True, liga_obligatoria=True):
-        if con_liga:
-            sp.add_argument("--liga", required=liga_obligatoria,
-                            help="codigo de liga, o varios separados por coma")
-        sp.add_argument("--temporadas", type=int, default=4,
-                        help="temporadas de historico a usar (por defecto 4)")
+    def con_hiperparametros(sp):
+        """Los subcomandos que ajustan el modelo comparten estos dos."""
         sp.add_argument("--xi", type=float, default=XI_POR_DEFECTO,
                         help=f"factor de olvido temporal (por defecto {XI_POR_DEFECTO})")
         sp.add_argument("--regularizacion", type=float,
                         default=REGULARIZACION_POR_DEFECTO,
                         help="fuerza del encogimiento hacia la media")
-        sp.add_argument("--actualizar", action="store_true",
-                        help="ignora la cache y vuelve a descargar los CSV")
         return sp
 
-    sp = sub.add_parser("ligas", help="lista las ligas disponibles")
-    sp.set_defaults(func=cmd_ligas)
-
-    sp = comunes(sub.add_parser("equipos", help="lista los equipos de una liga"))
+    sp = sub.add_parser("equipos", help="lista los equipos en la base local")
     sp.set_defaults(func=cmd_equipos)
 
-    sp = comunes(sub.add_parser("partido", help="predice un partido concreto"))
+    sp = con_hiperparametros(sub.add_parser("partido", help="predice un partido concreto"))
     sp.add_argument("--local", required=True, help="equipo local")
     sp.add_argument("--visitante", required=True, help="equipo visitante")
     sp.add_argument("--neutral", action="store_true",
@@ -352,26 +339,26 @@ def construir_parser() -> argparse.ArgumentParser:
     sp.add_argument("--json", action="store_true", help="salida en JSON")
     sp.set_defaults(func=cmd_partido)
 
-    sp = comunes(sub.add_parser("ratings", help="tabla de fuerza de los equipos"))
+    sp = con_hiperparametros(sub.add_parser("ratings", help="tabla de fuerza de los equipos"))
     sp.set_defaults(func=cmd_ratings)
 
-    sp = comunes(sub.add_parser("proximos", help="predice los partidos de los proximos dias"),
-                 liga_obligatoria=False)
+    sp = con_hiperparametros(
+        sub.add_parser("proximos", help="predice los proximos partidos de Premier League"))
     sp.set_defaults(func=cmd_proximos)
 
-    sp = comunes(sub.add_parser("backtest", help="valida el modelo contra el historico"))
+    sp = con_hiperparametros(sub.add_parser("backtest", help="valida el modelo contra el historico"))
     sp.add_argument("--dias-minimos", type=int, default=400, dest="dias_minimos",
                     help="dias de historico reservados para entrenar")
     sp.add_argument("--refit", type=int, default=7,
                     help="cada cuantos dias se reajusta el modelo")
     sp.add_argument("--umbral-ev", type=float, default=0.05, dest="umbral_ev",
                     help="EV minimo para simular una apuesta")
-    sp.set_defaults(func=cmd_backtest, temporadas=6)
+    sp.set_defaults(func=cmd_backtest)
 
-    sp = comunes(sub.add_parser("optimizar", help="busca el mejor xi para una liga"))
+    sp = con_hiperparametros(sub.add_parser("optimizar", help="busca el mejor xi"))
     sp.add_argument("--dias-minimos", type=int, default=400, dest="dias_minimos")
     sp.add_argument("--refit", type=int, default=14)
-    sp.set_defaults(func=cmd_optimizar, temporadas=6)
+    sp.set_defaults(func=cmd_optimizar)
 
     return p
 

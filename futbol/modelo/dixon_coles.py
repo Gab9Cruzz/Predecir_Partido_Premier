@@ -53,7 +53,7 @@ from futbol.fuentes.base import Partido, buscar_equipo
 # Valor elegido optimizando el RPS del backtest walk-forward en LaLiga,
 # Premier, Bundesliga y Serie A (6 temporadas cada una). El optimo de cada liga
 # cae entre 0.0015 y 0.0030; 0.0018 esta cerca del mejor en las cuatro.
-# Puedes recalcularlo para tu liga con: python predecir.py optimizar --liga XX
+# Puedes recalcularlo para tu liga con: python predecir.py optimizar
 XI_POR_DEFECTO = 0.0018        # semivida ~385 dias
 # Tambien elegida por backtest (LaLiga, Premier, Serie A). Entre 1 y 4 el
 # resultado apenas cambia; por encima de 8 empeora claramente.
@@ -327,7 +327,7 @@ class DixonColes:
         if not candidatos:
             raise KeyError(
                 f"No encuentro ningun equipo parecido a '{consulta}'. "
-                f"Corre `python predecir.py equipos --liga <LIGA>` para ver la lista."
+                f"Corre `python predecir.py equipos` para ver la lista."
             )
         return candidatos[0]
 

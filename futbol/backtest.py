@@ -155,7 +155,8 @@ def ejecutar(partidos: list[Partido], xi: float = XI_POR_DEFECTO,
              regularizacion: float = REGULARIZACION_POR_DEFECTO,
              dias_minimos: int = 400,
              refit_cada_dias: int = 7, umbral_ev: float = 0.05,
-             verboso: bool = True) -> ResultadoBacktest:
+             verboso: bool = True,
+             evaluar_ligas: set[str] | None = None) -> ResultadoBacktest:
     """Backtest walk-forward.
 
     dias_minimos     dias de historico que se reservan para entrenar antes de
@@ -163,6 +164,13 @@ def ejecutar(partidos: list[Partido], xi: float = XI_POR_DEFECTO,
     refit_cada_dias  cada cuantos dias se reajusta el modelo. Reajustar todos
                      los dias es lo mas correcto pero tarda mas; con 7 dias el
                      resultado apenas cambia.
+    evaluar_ligas    si se pasa, solo se puntuan (RPS/Brier/etc.) los partidos
+                     de esas ligas -- el resto de `partidos` se sigue usando
+                     para entrenar (conectividad), pero no cuenta en la
+                     metrica final. Sin esto, cargar dos ligas juntas (p.ej.
+                     Premier + Championship para conectar ascendidos) mezcla
+                     sus partidos en un solo RPS agregado, que no es
+                     comparable con un backtest de una sola liga.
     """
     jugados = sorted([p for p in partidos if p.jugado], key=lambda p: p.fecha)
     if not jugados:
@@ -170,6 +178,8 @@ def ejecutar(partidos: list[Partido], xi: float = XI_POR_DEFECTO,
 
     inicio_eval = jugados[0].fecha + timedelta(days=dias_minimos)
     a_evaluar = [p for p in jugados if p.fecha >= inicio_eval]
+    if evaluar_ligas is not None:
+        a_evaluar = [p for p in a_evaluar if p.liga in evaluar_ligas]
     if len(a_evaluar) < 30:
         raise ValueError(
             f"Solo quedan {len(a_evaluar)} partidos para evaluar. "
@@ -306,11 +316,15 @@ def optimizar_xi(partidos: list[Partido],
                  valores: list[float] | None = None,
                  dias_minimos: int = 400,
                  refit_cada_dias: int = 14,
-                 verboso: bool = True) -> tuple[float, list[tuple[float, float]]]:
+                 verboso: bool = True,
+                 evaluar_ligas: set[str] | None = None) -> tuple[float, list[tuple[float, float]]]:
     """Busca el mejor factor de olvido temporal minimizando el RPS del backtest.
 
     Es el unico hiperparametro que de verdad mueve la aguja: controla cuanto
     pesa el pasado lejano frente a la forma reciente.
+
+    evaluar_ligas  ver docstring de ejecutar() -- restringe que ligas cuentan
+                   para el RPS que se esta minimizando.
     """
     valores = valores or [0.0, 0.0008, 0.0015, 0.0018, 0.0022, 0.0030, 0.0045, 0.0065]
     resultados: list[tuple[float, float]] = []
@@ -318,7 +332,8 @@ def optimizar_xi(partidos: list[Partido],
     for xi in valores:
         try:
             res = ejecutar(partidos, xi=xi, dias_minimos=dias_minimos,
-                           refit_cada_dias=refit_cada_dias, verboso=False)
+                           refit_cada_dias=refit_cada_dias, verboso=False,
+                           evaluar_ligas=evaluar_ligas)
         except ValueError as exc:
             if verboso:
                 print(f"  xi={xi:.4f}  fallo: {exc}")

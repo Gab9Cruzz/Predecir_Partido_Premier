@@ -133,3 +133,8 @@ def buscar_equipo(consulta: str, equipos: list[str],
 
     candidatos.sort(key=lambda x: (-x[1], x[0]))
     return candidatos[:n]
+
+
+def equipos_de(partidos: list[Partido]) -> list[str]:
+    """Nombres unicos de equipo (local + visitante) en una lista de partidos."""
+    return sorted({p.local for p in partidos} | {p.visitante for p in partidos})

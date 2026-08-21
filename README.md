@@ -1,328 +1,281 @@
 # PredicirUnPartido
 
-Predice el resultado y la probabilidad de victoria de un partido de fútbol con un
-modelo **Dixon–Coles** ajustado por máxima verosimilitud sobre datos **gratuitos,
-sin API key y actualizados hasta hace uno o dos días**.
+Predice el resultado y la probabilidad de victoria de un partido de **Premier
+League** con un modelo **Dixon–Coles** ajustado por máxima verosimilitud,
+sobre una base de datos local en SQLite que vos mismo controlás y
+actualizás.
 
 ```
-python predecir.py partido --liga SP1 --local Barcelona --visitante "Real Madrid"
+python predecir.py partido --local Arsenal --visitante Chelsea
 ```
 
 ```
 ====================================================================
-  Barcelona  vs  Real Madrid
+  Arsenal  vs  Chelsea
 ====================================================================
 
-Goles esperados : 1.99 - 1.34
-Marcador top    : 2-1 (9.5%)
+Goles esperados : 1.92 - 0.87
+Marcador top    : 2-0 (11.3%)
 
 Resultado                probabilidad   cuota justa
 ----------------------------------------------------
-Gana Barcelona           52.7%      1.90  ##################
-Empate                   21.5%      4.64  #######
-Gana Real Madrid         25.8%      3.88  #########
+Gana Arsenal              61.5%      1.63  #####################
+Empate                    22.5%      4.44  ########
+Gana Chelsea               16.0%      6.26  #####
 ```
 
 ---
 
-## 1. El problema de la API anterior, y cuál se usa ahora
+## 1. Alcance: solo Premier League
 
-El proyecto usaba **API-Football (api-sports.io)**. En el plan gratuito esa API
-solo da acceso a unas pocas temporadas antiguas, así que era imposible predecir
-nada actual sin pagar.
+El proyecto ya no cubre 38 ligas. Predice **una sola competición, Premier
+League**, sobre una base de datos local en vez de descargar CSV en cada
+corrida.
 
-La fuente nueva es **[football-data.co.uk](https://www.football-data.co.uk)**:
-
-| | API-Football (plan gratis) | football-data.co.uk |
-|---|---|---|
-| API key | obligatoria | **ninguna** |
-| Registro | sí | **no** |
-| Límite de peticiones | 100/día | ninguno |
-| Temporadas | solo antiguas | **histórico completo + temporada en curso** |
-| Actualización | — | cada pocas horas |
-| Cuotas del mercado | no en el plan gratis | **sí, de 10+ casas** |
-| Tiros, córners, tarjetas | no en el plan gratis | sí (ligas europeas) |
-
-Se comprobó al construir esto: los datos llegaban hasta **dos días antes**, tanto
-en LaLiga como en la liga argentina, la brasileña o la MLS.
-
-Son **38 ligas**. `python predecir.py ligas` las lista todas:
-
-- **Europa** (con estadísticas de tiros, córners y tarjetas): Inglaterra (5
-  divisiones), Escocia (4), Alemania (2), Italia (2), España (2), Francia (2),
-  Holanda, Bélgica, Portugal, Turquía, Grecia.
-- **Resto del mundo** (resultado + cuotas): Argentina, Brasil, México, EEUU,
-  Japón, China, Austria, Dinamarca, Finlandia, Irlanda, Noruega, Polonia,
-  Rumanía, Rusia, Suecia, Suiza.
-
-El código antiguo quedó en [`legacy/`](legacy/) por si quieres consultarlo.
+- La base (`BD_SQLITE/futbol_predicciones.db`) tiene Premier League y
+  Championship, 2000-2026: 23.950 partidos jugados, resultado completo.
+- El modelo se entrena con **ambas** divisiones combinadas, pero solo
+  predice y se valida sobre Premier League. Por qué Championship: sin su
+  historial, un equipo recién ascendido llega cada temporada con cero
+  partidos previos y el modelo no tiene con qué estimarlo. Con Championship
+  cargado, el grafo de partidos queda conectado y el modelo separa el nivel
+  de cada división solo, sin configuración manual.
+- Validado contra el backtest walk-forward (ver §6): el puente a la base
+  local funciona igual o mejor que el pipeline CSV que reemplazó.
 
 ---
 
-## 2. Instalación
+## 2. La base de datos local
+
+Vive en `BD_SQLITE/futbol_predicciones.db`, SQLite (cero dependencias
+nuevas, es un archivo, no un servicio que mantener). Cuatro tablas:
+
+```
+equipos               catálogo: nombre crudo del CSV, nombre corto oficial,
+                       código de 3 letras, liga actual
+partidos               fecha, temporada, liga (E0/E1), goles, equipos, fuente
+estadisticas_partido   tiros, tiros a puerta, corners, faltas, tarjetas
+                       (posesión: columna lista, sin dato disponible todavía)
+cuotas_cierre          mercados 1x2 / over_under / hándicap asiático,
+                       formato largo (una fila por partido y mercado)
+```
+
+### Scripts de mantenimiento (`BD_SQLITE/`)
+
+| script | para qué |
+|---|---|
+| `init_db.py` | crea el esquema (idempotente, `CREATE TABLE IF NOT EXISTS`) |
+| `cargar_datos.py` | descarga el histórico completo de football-data.co.uk (E0 + E1) y lo carga a la base. Reintentable: una fila con error no tira la temporada entera |
+| `actualizar_resultados.py` | trae la jornada más reciente y hace UPSERT — completa resultados de partidos que estaban pendientes, sin duplicar nada |
+| `equipos_premier.py` | catálogo de 44 equipos (nombre oficial, nombre corto, código) usado para normalizar nombres, tanto en la ingesta como al resolver lo que escribís en `predecir.py partido` |
+
+Los scripts de descarga manejan el caso de temporada todavía no publicada
+(football-data.co.uk responde HTTP 300 con una página de error en vez de
+404): lo detectan y avisan, no crashean.
+
+```bash
+cd BD_SQLITE
+python init_db.py              # una vez, crea el esquema
+python cargar_datos.py         # carga histórico completo (tarda: 26 temporadas)
+python actualizar_resultados.py   # corré esto seguido: resultados Y próximos partidos
+```
+
+`actualizar_resultados.py` hace dos cosas cada vez que corre: trae los
+resultados de la jornada más reciente (completa partidos que estaban
+pendientes) y trae el calendario de próximos partidos con las cuotas
+actuales del mercado. Es la única parte del proyecto que todavía habla con
+football-data.co.uk — todo lo demás (`predecir.py` completo) solo lee la
+base local.
+
+---
+
+## 3. Instalación
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Solo hacen falta `requests`, `numpy` y `scipy`. No hay que configurar nada más:
-no hay claves, ni `.env`, ni cuentas.
-
-Para comprobar que todo funciona:
-
-```bash
-python tests.py
-```
+`requests`, `numpy`, `scipy` para el modelo; `pandas` para los scripts de
+`BD_SQLITE/`. Sin API keys, sin `.env`, sin cuentas.
 
 ---
 
-## 3. Uso
-
-### Ver las ligas y los equipos disponibles
-
-```bash
-python predecir.py ligas
-python predecir.py equipos --liga SP1
-```
+## 4. Uso del predictor
 
 ### Predecir un partido
 
 ```bash
-python predecir.py partido --liga SP1 --local Barcelona --visitante "Real Madrid"
+python predecir.py partido --local Arsenal --visitante Chelsea
 ```
 
-Los nombres no tienen que ser exactos: `atl. madrid`, `espanyol` o
-`rayo vallecano` se resuelven solos, y el programa te dice con qué los emparejó.
-Si un nombre no existe en los datos **no se inventa uno parecido**: te avisa.
+Los nombres no tienen que ser exactos. Dos caminos, en este orden:
+1. El catálogo de `equipos_premier.py` — reconoce nombre oficial, nombre
+   corto y el código de 3 letras (`"Manchester City"`, `"Man City"`, `"MCI"`
+   resuelven igual).
+2. Si no matchea ahí, cae al emparejamiento aproximado de `base.py` —
+   típos como `"Arsnal"` o abreviaciones como `"spurs"` también resuelven.
+
+Si un nombre no existe en los datos, no se inventa uno parecido: avisa.
 
 Opciones útiles:
 
 | opción | para qué |
 |---|---|
 | `--cuotas 1.95 3.90 3.60` | compara tus probabilidades con las del mercado y calcula el EV |
-| `--neutral` | campo neutral (finales a sede única): reparte la ventaja de local |
-| `--temporadas 6` | cuánto histórico usar (por defecto 4) |
+| `--neutral` | campo neutral: reparte la ventaja de local |
 | `--json` | salida en JSON para usarla desde otro programa |
-| `--actualizar` | ignora la caché y vuelve a descargar |
 
-### Predecir todos los partidos de los próximos días
-
-```bash
-python predecir.py proximos --liga SP1,E0
-python predecir.py proximos              # todas las ligas a la vez
-```
-
-Trae el calendario con las cuotas que ofrece el mercado ahora mismo, predice cada
-partido y señala dónde más discrepan modelo y mercado.
-
-### Ver la fuerza estimada de cada equipo
+### Ver los equipos y la fuerza estimada
 
 ```bash
-python predecir.py ratings --liga SP1
+python predecir.py equipos
+python predecir.py ratings
 ```
 
-```
-    # equipo                     ataque  defensa  general    pj
-  ------------------------------------------------------------
-    1 Barcelona                   +0.66    +0.28    +0.94   114
-    2 Real Madrid                 +0.49    +0.36    +0.85   114
-    3 Ath Madrid                  +0.31    +0.22    +0.53   114
-```
-
-No es la tabla de posiciones: es la fuerza real estimada, ya descontada la
-calidad de los rivales a los que se ha enfrentado cada equipo.
+`ratings` no es la tabla de posiciones: es la fuerza real estimada, ya
+descontada la calidad de los rivales a los que se enfrentó cada equipo.
 
 ### Validar el modelo
 
 ```bash
-python predecir.py backtest --liga SP1
-python predecir.py optimizar --liga SP1     # busca el mejor xi para esa liga
+python predecir.py backtest
+python predecir.py optimizar     # busca el mejor xi
 ```
+
+### Próximos partidos
+
+```bash
+python predecir.py proximos
+```
+
+Lee de la base local igual que todo lo demás — cero descargas en vivo desde
+`predecir.py`. Los partidos que todavía no se jugaron quedan en `partidos`
+con `goles_local`/`goles_visitante` en `NULL`; cuando se juegan,
+`actualizar_resultados.py` completa esa misma fila con el resultado real
+(mismo `UPSERT`, no se duplica nada). Si no corriste
+`actualizar_resultados.py` últimamente, este comando avisa y no muestra
+nada — no se inventa partidos.
 
 ---
 
-## 4. Cómo funciona el modelo
+## 5. Cómo funciona el modelo
 
-### Lo que hacía la versión anterior, y por qué fallaba
-
-El script antiguo calculaba los goles esperados así:
-
-```
-lambda_local = (goles_a_favor_del_local_en_casa + goles_en_contra_del_visitante_fuera) / 2
-```
-
-Eso tiene un fallo grave: **no corrige por la calidad del rival**. Un equipo que
-acaba de jugar contra los cinco últimos de la tabla parece buenísimo, y uno que
-jugó contra los cinco primeros parece malísimo. El sesgo es enorme.
-
-Además mezclaba tres componentes (forma, head-to-head, clasificación) con pesos
-inventados a mano, y el head-to-head sobre 10 partidos repartidos en años es casi
-puro ruido.
-
-### Lo que hace ahora
-
-Se estiman a la vez, por máxima verosimilitud, **un parámetro de ataque y uno de
-defensa para cada equipo**:
+Se estiman a la vez, por máxima verosimilitud, **un parámetro de ataque y
+uno de defensa para cada equipo**:
 
 ```
 goles_local  ~ Poisson(exp(mu + ataque_local  - defensa_visitante + ventaja_local))
 goles_visita ~ Poisson(exp(mu + ataque_visitante - defensa_local))
 ```
 
-Como todos los equipos aparecen en la misma ecuación, la fuerza del rival queda
-descontada automáticamente: no hace falta ningún peso a mano.
+Como todos los equipos aparecen en la misma ecuación, la fuerza del rival
+queda descontada automáticamente. Encima de eso:
 
-Encima de eso hay tres cosas más:
+1. **Corrección τ de Dixon–Coles.** Dos Poisson independientes subestiman
+   los 0-0 y 1-1 y sobreestiman los 1-0 y 0-1. El parámetro ρ corrige
+   exactamente esas cuatro casillas — donde más se juegan los empates.
 
-1. **Corrección τ de Dixon–Coles.** Dos Poisson independientes subestiman los 0-0
-   y 1-1 y sobreestiman los 1-0 y 0-1. El parámetro ρ corrige exactamente esas
-   cuatro casillas, que es donde se juegan los empates.
+2. **Ponderación temporal.** Cada partido pesa
+   `exp(-xi · días_de_antigüedad)`. El valor por defecto (`xi = 0.0018`,
+   semivida ≈ 385 días) salió de minimizar el RPS del backtest.
+   Recalculable con `predecir.py optimizar`.
 
-2. **Ponderación temporal.** Cada partido pesa `exp(-xi · días_de_antigüedad)`.
-   El valor por defecto (`xi = 0.0018`, semivida ≈ 385 días) no es inventado: se
-   eligió **minimizando el RPS del backtest** en LaLiga, Premier, Bundesliga y
-   Serie A. Puedes recalcularlo para tu liga con `predecir.py optimizar`.
+3. **Regularización L2.** Encoge hacia la media a los equipos con pocos
+   partidos — un recién ascendido no se lleva un rating extremo por una
+   racha corta de 3 jornadas.
 
-3. **Regularización L2.** Encoge hacia la media a los equipos con pocos partidos.
-   Un recién ascendido con tres jornadas no se lleva un rating extremo por una
-   racha corta. El valor por defecto (2.0) también salió del backtest.
+El ajuste usa gradiente analítico con L-BFGS-B: se ajusta en menos de una
+décima de segundo, lo que hace viable reajustar el modelo cientos de veces
+durante un backtest.
 
-El ajuste usa **gradiente analítico** con L-BFGS-B: una liga entera se ajusta en
-menos de una décima de segundo, lo que hace viable reajustar el modelo cientos de
-veces durante un backtest.
-
-Referencia: Dixon, M.J. y Coles, S.G. (1997), *Modelling Association Football
-Scores and Inefficiencies in the Football Betting Market*, Applied Statistics
-46(2), 265–280.
+Referencia: Dixon, M.J. y Coles, S.G. (1997), *Modelling Association
+Football Scores and Inefficiencies in the Football Betting Market*, Applied
+Statistics 46(2), 265–280.
 
 ---
 
-## 5. ¿Funciona? Resultados medidos
+## 6. ¿Funciona? Resultados medidos
 
-`backtest` recorre el histórico hacia adelante y predice cada partido usando
-**solo** los partidos anteriores a él, reajustando el modelo cada semana. Se
-compara contra dos rivales: el azar y las cuotas de cierre del mercado.
+Backtest walk-forward vía `bd_local.py` (Premier League + Championship
+2000-2026 para entrenar, solo Premier League puntuada: entrenar con las dos
+divisiones le da conectividad al grafo de partidos, pero el RPS solo tiene
+sentido medido sobre lo que efectivamente se predice — mezclarlas en la
+métrica final habría dado un número no comparable con nada):
 
-Resultado sobre 6 temporadas por liga, unos **18.000 partidos** en total:
+| partidos evaluados | RPS modelo | RPS mercado | diferencia | acierto modelo | acierto mercado |
+|---|---|---|---|---|---|
+| 9.368 | 0.1986 | 0.1942 | +0.0044 | 53.4% | 54.3% |
 
-| liga | partidos | RPS modelo | RPS mercado | diferencia | acierto modelo | acierto mercado |
-|---|---|---|---|---|---|---|
-| Premier League | 1454 | 0.2028 | 0.1949 | +0.0079 | 53.4% | 55.2% |
-| LaLiga | 1469 | 0.1978 | 0.1916 | +0.0062 | 53.0% | 54.7% |
-| Bundesliga | 1164 | 0.2016 | 0.1935 | +0.0080 | 52.1% | 55.5% |
-| Serie A | 1446 | 0.1967 | 0.1907 | +0.0059 | 52.7% | 53.8% |
-| Ligue 1 | 1235 | 0.2075 | 0.2013 | +0.0062 | 52.2% | 54.1% |
-| Eredivisie | 1183 | 0.1921 | 0.1854 | +0.0066 | 54.3% | 56.2% |
-| Primeira Liga | 1190 | 0.1823 | 0.1759 | +0.0064 | 56.5% | 58.6% |
-| Argentina | 2591 | 0.2150 | 0.2109 | +0.0041 | 42.3% | 43.7% |
-| Brasil | 1914 | 0.2086 | 0.2007 | +0.0079 | 49.0% | 51.3% |
-| México | 1649 | 0.2108 | 0.2041 | +0.0067 | 49.7% | 50.9% |
-| MLS | 2503 | 0.2204 | 0.2116 | +0.0088 | 47.2% | 48.5% |
+*RPS = Ranked Probability Score. Más bajo es mejor. El azar puro está en
+~0.235.*
 
-*RPS = Ranked Probability Score, la métrica estándar en predicción de fútbol.
-Más bajo es mejor. El azar puro está en ~0.235.*
-
-Cómo leerlo:
-
-- **El modelo bate al azar con holgura** en las 11 ligas.
-- **Está bien calibrado**: cuando dice 30%, pasa aproximadamente el 30% de las
-  veces (el backtest imprime la tabla de calibración).
-- **Pierde contra el mercado por poco pero de forma sistemática**: entre 0.004 y
-  0.009 de RPS, y entre 1 y 3 puntos de acierto. Esto es lo esperable y es
-  información valiosa, no un fracaso: el mercado incorpora alineaciones,
-  lesiones y rotaciones que este modelo no ve.
+- **El modelo bate al azar con holgura.**
+- **Está bien calibrado**: cuando dice 30%, pasa aproximadamente el 30% de
+  las veces.
+- **Está a la altura del mercado, algo por detrás** (+0.0044 de RPS, -0.9
+  puntos de acierto). Es lo esperable: el mercado incorpora alineaciones,
+  lesiones y rotaciones que este modelo no ve. Es mejor que el resultado
+  del pipeline CSV anterior (+0.0079 de RPS sobre 6 temporadas) — esperable
+  también, porque ahora entrena con 26 temporadas y con la conectividad que
+  da Championship.
 
 ---
 
-## 6. Limitaciones (léelas)
+## 7. Limitaciones (léelas)
 
-**No sirve para ganar dinero apostando.** El backtest incluye una simulación de
-apuestas de valor con criterio de Kelly. En LaLiga, 968 apuestas dieron un
-**ROI de −15.1%**, y un bankroll de 1.00 acabó en 0.028. Es el resultado esperado: el modelo pierde contra el mercado,
-y encima hay que pagar el margen de la casa (~5%). Las discrepancias que marca
-`proximos` son *puntos donde el modelo no coincide con el mercado*, y lo más
-probable es que el equivocado sea el modelo.
+**No sirve para ganar dinero apostando.** El modelo pierde contra el
+mercado de forma sistemática (ver §6), y encima hay que pagar el margen de
+la casa. Cualquier discrepancia grande entre el modelo y las cuotas es
+mucho más probable que sea un error del modelo que una oportunidad real.
 
-**Copa Libertadores y otras competiciones continentales no están cubiertas.**
-Ninguna fuente gratuita las ofrece con datos actuales: football-data.co.uk no las
-incluye, y en football-data.org están en un plan de pago. Lo que sí se puede
-hacer es cargar las ligas domésticas de los equipos implicados:
+**Lo que el modelo no ve:** alineaciones, lesiones, sanciones, si el equipo
+tiene partido de Champions o de copa entre semana, cambios de entrenador,
+si el partido no vale nada porque ya está todo decidido, y el clima. Todo
+eso sí lo ve el mercado, y por eso gana. La idea a futuro es capturar esto
+como *feature* de rotación/fatiga en una capa de ML (no cubierta todavía),
+no meterlo como partidos de entrenamiento adicionales.
 
-```bash
-python predecir.py partido --liga ARG,BRA --local "Boca Juniors" --visitante Palmeiras --neutral
-```
-
-Aviso importante sobre esto: cuando dos ligas **nunca se enfrentan entre sí**
-(argentina contra brasileña), sus niveles no son directamente comparables. El
-modelo iguala el nivel goleador de ambas pero no sabe cuál es más fuerte, así
-que ese resultado hay que tomárselo como orientativo. En cambio, con divisiones
-del mismo país (`--liga SP1,SP2`) sí funciona bien: los ascensos y descensos de
-las temporadas cargadas conectan las dos categorías, y el modelo llega a separar
-LaLiga de LaLiga 2 por unos 0.41 log-goles sin que nadie se lo diga.
-
-**Lo que el modelo no ve:** alineaciones, lesiones, sanciones, si el equipo tiene
-partido de Champions entre semana, cambios de entrenador, si el partido no vale
-nada porque ya está todo decidido, y el clima. Todo eso sí lo ve el mercado, y
-por eso gana.
-
-**Equipos con pocos partidos.** Un recién ascendido tiene el rating muy encogido
-hacia la media; el programa lo marca con `*` y avisa. Ahí las predicciones son
-flojas, y son también las que generan falsos "valores" espectaculares.
+**Equipos con pocos partidos.** Un recién ascendido tiene el rating muy
+encogido hacia la media (la regularización lo hace a propósito); el
+programa lo marca y avisa. Ahí las predicciones son flojas.
 
 ---
 
-## 7. Estructura del proyecto
+## 8. Estructura del proyecto
 
 ```
-predecir.py                     interfaz de línea de comandos
-tests.py                        pruebas (python tests.py)
+predecir.py                     interfaz de línea de comandos -- solo lee la base local
+BD_SQLITE/
+  init_db.py                    crea el esquema
+  cargar_datos.py               ingesta histórica completa (E0 + E1)
+  actualizar_resultados.py      sincroniza resultados Y próximos partidos (UPSERT)
+  equipos_premier.py            catálogo de equipos: nombre oficial/corto/código
+  futbol_predicciones.db        la base en sí (no versionada, ver .gitignore)
 futbol/
   fuentes/
-    base.py                     Partido + emparejamiento de nombres de equipo
-    footballdata_uk.py          descarga y parseo de football-data.co.uk
+    base.py                     Partido + emparejamiento aproximado de nombres
+    bd_local.py                  lee BD_SQLITE/ y arma la lista de Partido para el modelo
   modelo/
-    dixon_coles.py              el modelo: ajuste, predicción y ratings
-    mercado.py                  cuotas, probabilidades implícitas, Kelly, métricas
+    dixon_coles.py               el modelo: ajuste, predicción y ratings
+    mercado.py                   cuotas, probabilidades implícitas, Kelly, métricas
   backtest.py                   validación walk-forward y optimización de xi
-datos/cache/                    CSV descargados (caché de 6 horas)
-legacy/                         el código anterior, basado en API-Football
 ```
+
+No queda ningún módulo que descargue CSV en vivo dentro de `predecir.py`/
+`futbol/` -- eso es trabajo exclusivo de los scripts de `BD_SQLITE/`, que se
+corren aparte y por separado del predictor.
 
 Como biblioteca:
 
 ```python
-from futbol.fuentes import footballdata_uk as fuente
+from futbol.fuentes import bd_local
 from futbol.modelo import DixonColes
 
-partidos = fuente.cargar("SP1", temporadas=4)
+partidos = bd_local.cargar_para_ajuste()   # Premier League + Championship
 modelo = DixonColes().ajustar(partidos)
 
-pred = modelo.predecir("Barcelona", "Real Madrid")
+pred = modelo.predecir("Arsenal", "Chelsea", liga="E0")
 print(pred.prob_local, pred.prob_empate, pred.prob_visitante)
 print(pred.prob_mas_de(2.5), pred.prob_ambos_marcan)
 print(pred.marcadores_probables[:3])
 ```
-
----
-
-## 8. Resumen de qué cambió
-
-| | antes | ahora |
-|---|---|---|
-| Datos | API-Football, temporadas viejas | football-data.co.uk, hasta hace 2 días |
-| API key | obligatoria (y estaba escrita en el código) | ninguna |
-| Ligas | dependía del plan | 38 |
-| Modelo | promedios de goles con pesos a mano | Dixon–Coles por máxima verosimilitud |
-| Calidad del rival | ignorada | descontada por el propio ajuste |
-| Empates | Poisson simple | corrección τ de Dixon–Coles |
-| Pasado lejano | mismo peso que ayer | decaimiento exponencial calibrado |
-| Pocos partidos | rating extremo | encogido hacia la media |
-| Validación | ninguna real | walk-forward sobre 18.000 partidos |
-| Comparación con el mercado | ninguna | RPS, Brier, LogLoss, calibración y ROI |
-| Salidas | 1X2 y marcador | 1X2, over/under, BTTS, hándicap, top-10 marcadores |
-| Nombres de equipo | IDs numéricos a mano | búsqueda por nombre, sin falsos positivos |
-| Pruebas | ninguna | 67 comprobaciones, incluida la del gradiente |
-
-Sobre la API key: la del proyecto anterior estaba escrita directamente en
-`EQUIPOS.PY` y `SIMULAR_UNPARTIDO.py`, y sigue ahí en `legacy/`. Si esa cuenta te
-importa, **revócala y genera otra**; da igual que el plan sea gratuito.
