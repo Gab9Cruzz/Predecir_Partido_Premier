@@ -33,6 +33,7 @@ import equipos_premier  # noqa: E402
 from futbol.backtest import ejecutar as ejecutar_backtest, optimizar_xi
 from futbol.fuentes import bd_local
 from futbol.fuentes.base import equipos_de
+from futbol.modelo.ascenso import es_ascendido, mapa_ascendidos
 from futbol.modelo.dixon_coles import (
     REGULARIZACION_POR_DEFECTO,
     XI_POR_DEFECTO,
@@ -51,11 +52,20 @@ BARRA = "=" * 68
 # Liga que efectivamente se predice. Championship (E1) se carga junto con
 # esta solo para darle conectividad al grafo de partidos -- ver bd_local.py.
 LIGA_PREDICCION = "E0"
+LIGA_INFERIOR = "E1"
+
+# Correccion empirica de recien ascendidos: (delta_ataque, delta_defensa) en
+# escala log, medido sobre 75 equipo-temporadas de ascendidos reales
+# (2001-2026, ver futbol/modelo/ascenso.py) validado por backtest
+# walk-forward. El rating implicito por la historia en Championship
+# sobreestima tanto el ataque como (mas) la defensa de un equipo en su
+# primera temporada de vuelta en Premier League.
+CORRECCION_ASCENSO = (-0.043, -0.063)
 
 
 # --------------------------------------------------------------------- helpers
 
-def _cargar_modelo(args) -> tuple[DixonColes, list]:
+def _cargar_modelo(args) -> tuple[DixonColes, list, dict[str, set[str]]]:
     partidos = bd_local.cargar_para_ajuste()
     if not partidos:
         print("No hay datos en la base local. Corre 'python BD_SQLITE/init_db.py' "
@@ -64,7 +74,23 @@ def _cargar_modelo(args) -> tuple[DixonColes, list]:
 
     modelo = DixonColes(xi=args.xi, regularizacion=args.regularizacion)
     modelo.ajustar(partidos)
-    return modelo, partidos
+    ascendidos = mapa_ascendidos(partidos, liga=LIGA_PREDICCION, liga_inferior=LIGA_INFERIOR)
+    return modelo, partidos, ascendidos
+
+
+def _temporada_actual(partidos: list) -> str | None:
+    """La temporada mas reciente con partidos jugados de Premier League --
+    para saber a que temporada pertenecen los equipos al aplicar la
+    correccion de recien ascendido en predicciones en vivo."""
+    temporadas = {p.temporada for p in partidos if p.liga == LIGA_PREDICCION}
+    return max(temporadas) if temporadas else None
+
+
+def _ajuste_ascenso(equipo: str, temporada: str | None,
+                    ascendidos: dict[str, set[str]]) -> tuple[float, float]:
+    if temporada is None or not es_ascendido(equipo, temporada, ascendidos):
+        return (0.0, 0.0)
+    return CORRECCION_ASCENSO
 
 
 def _mostrar_prediccion(pred: Prediccion, cuotas: tuple | None = None,
@@ -173,13 +199,32 @@ def _resolver_via_catalogo(nombre: str) -> str:
 
 
 def cmd_partido(args) -> None:
-    modelo, _ = _cargar_modelo(args)
+    modelo, partidos, ascendidos = _cargar_modelo(args)
     cuotas = tuple(args.cuotas) if args.cuotas else None
+    temporada_actual = _temporada_actual(partidos)
+
+    # Se resuelve el nombre ANTES de predecir (no dentro de predecir(), con
+    # estricto=False) para poder aplicar la correccion de ascenso al nombre
+    # exacto del dataset. Las notas de "se interpreto como" se reconstruyen
+    # a mano porque estricto=True no las genera.
+    local_catalogo = _resolver_via_catalogo(args.local)
+    visitante_catalogo = _resolver_via_catalogo(args.visitante)
+    local, conf_l = modelo.resolver_equipo(local_catalogo)
+    visitante, conf_v = modelo.resolver_equipo(visitante_catalogo)
+
+    ajuste_local = _ajuste_ascenso(local, temporada_actual, ascendidos)
+    ajuste_visitante = _ajuste_ascenso(visitante, temporada_actual, ascendidos)
+
     pred = modelo.predecir(
-        _resolver_via_catalogo(args.local), _resolver_via_catalogo(args.visitante),
-        liga=LIGA_PREDICCION,
-        campo_neutral=args.neutral,
+        local, visitante, liga=LIGA_PREDICCION,
+        campo_neutral=args.neutral, estricto=True,
+        ajuste_local=ajuste_local, ajuste_visitante=ajuste_visitante,
     )
+    if local != local_catalogo:
+        pred.emparejamientos.append((local_catalogo, local, conf_l))
+    if visitante != visitante_catalogo:
+        pred.emparejamientos.append((visitante_catalogo, visitante, conf_v))
+
     if args.json:
         print(json.dumps({
             "local": pred.local,
@@ -195,12 +240,16 @@ def cmd_partido(args) -> None:
         }, indent=2, ensure_ascii=False))
         return
     print(f"\n{modelo.resumen()}")
+    corregidos = [e for e, aj in ((local, ajuste_local), (visitante, ajuste_visitante))
+                  if aj != (0.0, 0.0)]
+    if corregidos:
+        print(f"  correccion de recien ascendido aplicada a: {', '.join(corregidos)}")
     _mostrar_prediccion(pred, cuotas)
     print()
 
 
 def cmd_ratings(args) -> None:
-    modelo, _ = _cargar_modelo(args)
+    modelo, _, _ = _cargar_modelo(args)
     print(f"\n{modelo.resumen()}\n")
     print(f"  {'#':>3} {'equipo':<24}{'ataque':>9}{'defensa':>9}"
           f"{'general':>9}{'pj':>6}")
@@ -224,51 +273,60 @@ def cmd_proximos(args) -> None:
               "(sincroniza resultados Y proximos partidos).\n")
         return
 
-    modelo, _ = _cargar_modelo(args)
+    modelo, partidos, ascendidos = _cargar_modelo(args)
+    temporada_actual = _temporada_actual(partidos)
 
     print(f"\n{len(proximos)} proximos partidos de Premier League\n")
     print(BARRA)
     print(f"  Premier League (Inglaterra)")
     print(BARRA)
-    print(f"{'fecha':<12}{'partido':<40}{'1':>7}{'X':>7}{'2':>7}{'  xG':>10}")
-    print("-" * 84)
+    print(f"{'fecha':<12}{'partido':<40}{'1':>7}{'X':>7}{'2':>7}{'  xG':>10}  fuente")
+    print("-" * 92)
 
-    con_valor = []
     sin_historico: list[str] = []
+    con_cuotas = 0
     for p in proximos:
+        ajuste_local = _ajuste_ascenso(p.local, temporada_actual, ascendidos)
+        ajuste_visitante = _ajuste_ascenso(p.visitante, temporada_actual, ascendidos)
         try:
-            pred = modelo.predecir(p.local, p.visitante, liga=LIGA_PREDICCION)
+            pred = modelo.predecir(p.local, p.visitante, liga=LIGA_PREDICCION,
+                                   ajuste_local=ajuste_local, ajuste_visitante=ajuste_visitante)
         except KeyError:
             sin_historico.append(f"{p.local} vs {p.visitante}")
             continue
+
+        # El backtest walk-forward mostro que la probabilidad implicita en
+        # las cuotas de cierre predice mejor que el modelo en todo el rango
+        # probado. Cuando hay cuotas, se muestran esas probabilidades
+        # directamente; el modelo (con la correccion de ascenso) queda como
+        # red de seguridad solo para partidos sin cuotas.
+        if p.tiene_cuotas:
+            probs = probabilidades_implicitas(
+                (p.cuota_local, p.cuota_empate, p.cuota_visitante), metodo="potencia"
+            )
+            fuente = "mercado"
+            con_cuotas += 1
+        else:
+            probs = pred.probs
+            fuente = "modelo"
+
         enfrentamiento = f"{pred.local} vs {pred.visitante}"
-        # Un equipo con pocos partidos tiene el rating muy encogido: sus
-        # probabilidades son poco de fiar y generan falsos "valores".
-        poca_muestra = min(pred.partidos_local, pred.partidos_visitante) < 10
+        # Un equipo con pocos partidos tiene el rating muy encogido: su
+        # prediccion (cuando viene del modelo) es poco de fiar.
+        poca_muestra = fuente == "modelo" and min(pred.partidos_local, pred.partidos_visitante) < 10
         marca = " *" if poca_muestra else ""
         print(f"{str(p.fecha):<12}{(enfrentamiento + marca)[:39]:<40}"
-              f"{pred.prob_local:>7.1%}{pred.prob_empate:>7.1%}"
-              f"{pred.prob_visitante:>7.1%}"
+              f"{probs[0]:>7.1%}{probs[1]:>7.1%}{probs[2]:>7.1%}"
               f"{pred.goles_esperados_local:>6.2f}-"
-              f"{pred.goles_esperados_visitante:.2f}")
-        if p.tiene_cuotas and not poca_muestra:
-            cuotas = (p.cuota_local, p.cuota_empate, p.cuota_visitante)
-            evs = [valor_esperado(pred.probs[k], cuotas[k]) for k in range(3)]
-            mejor = int(np.argmax(evs))
-            if evs[mejor] >= 0.05:
-                con_valor.append((enfrentamiento, ["1", "X", "2"][mejor],
-                                  cuotas[mejor], evs[mejor], pred.probs[mejor]))
+              f"{pred.goles_esperados_visitante:.2f}  {fuente}")
 
     if sin_historico:
         print(f"\n  Sin historico suficiente: {', '.join(sin_historico)}")
-    if con_valor:
-        print(f"\n  Donde mas discrepa el modelo del mercado:")
-        for enf, signo, cuota, ev, prob in sorted(con_valor, key=lambda x: -x[3])[:5]:
-            print(f"    {enf[:38]:<40} {signo}  cuota {cuota:.2f}  "
-                  f"modelo {prob:.1%}  EV {ev:+.1%}")
 
-    print("\nRecuerda: en el backtest el mercado acierta mas que el modelo.")
-    print("Estas discrepancias son puntos a revisar, no recomendaciones.\n")
+    print(f"\n  {con_cuotas} de {len(proximos)} partidos muestran la probabilidad de mercado")
+    print("  directamente (fuente=mercado) -- el backtest mostro que predice mejor que")
+    print("  el modelo. El resto (fuente=modelo) usa Dixon-Coles con la correccion de")
+    print("  recien ascendido, por no tener cuotas disponibles.\n")
 
 
 def cmd_backtest(args) -> None:
@@ -278,11 +336,13 @@ def cmd_backtest(args) -> None:
     print("Se entrena con Premier League + Championship (conectividad), pero "
           "solo se puntua Premier League -- es la unica liga que se predice.")
     print(f"xi={args.xi}  regularizacion={args.regularizacion}  "
-          f"reajuste cada {args.refit} dias\n")
+          f"reajuste cada {args.refit} dias  "
+          f"correccion de ascenso={CORRECCION_ASCENSO}\n")
     resultado = ejecutar_backtest(
         partidos, xi=args.xi, regularizacion=args.regularizacion,
         dias_minimos=args.dias_minimos, refit_cada_dias=args.refit,
         umbral_ev=args.umbral_ev, evaluar_ligas={LIGA_PREDICCION},
+        correccion_ascenso=CORRECCION_ASCENSO,
     )
     print()
     print(resultado.texto())

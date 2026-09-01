@@ -31,6 +31,7 @@ from datetime import date, timedelta
 import numpy as np
 
 from futbol.fuentes.base import Partido
+from futbol.modelo.ascenso import mapa_ascendidos
 from futbol.modelo.dixon_coles import (
     REGULARIZACION_POR_DEFECTO,
     XI_POR_DEFECTO,
@@ -156,7 +157,9 @@ def ejecutar(partidos: list[Partido], xi: float = XI_POR_DEFECTO,
              dias_minimos: int = 400,
              refit_cada_dias: int = 7, umbral_ev: float = 0.05,
              verboso: bool = True,
-             evaluar_ligas: set[str] | None = None) -> ResultadoBacktest:
+             evaluar_ligas: set[str] | None = None,
+             correccion_ascenso: tuple[float, float] | None = None,
+             liga_ascenso: str = "E0", liga_inferior_ascenso: str = "E1") -> ResultadoBacktest:
     """Backtest walk-forward.
 
     dias_minimos     dias de historico que se reservan para entrenar antes de
@@ -171,6 +174,11 @@ def ejecutar(partidos: list[Partido], xi: float = XI_POR_DEFECTO,
                      Premier + Championship para conectar ascendidos) mezcla
                      sus partidos en un solo RPS agregado, que no es
                      comparable con un backtest de una sola liga.
+    correccion_ascenso  (delta_ataque, delta_defensa) aplicado en la
+                     prediccion (no en el ajuste MLE) a cualquier equipo
+                     recien ascendido a `liga_ascenso` esa temporada -- ver
+                     futbol/modelo/ascenso.py y CORRECCION_ASCENSO en
+                     predecir.py. None = sin correccion (default).
     """
     jugados = sorted([p for p in partidos if p.jugado], key=lambda p: p.fecha)
     if not jugados:
@@ -184,6 +192,12 @@ def ejecutar(partidos: list[Partido], xi: float = XI_POR_DEFECTO,
         raise ValueError(
             f"Solo quedan {len(a_evaluar)} partidos para evaluar. "
             f"Carga mas temporadas (--temporadas) o baja --dias-minimos."
+        )
+
+    ascendidos_por_temporada: dict[str, set[str]] | None = None
+    if correccion_ascenso is not None:
+        ascendidos_por_temporada = mapa_ascendidos(
+            jugados, liga=liga_ascenso, liga_inferior=liga_inferior_ascenso
         )
 
     probs_modelo: list[np.ndarray] = []
@@ -215,9 +229,18 @@ def ejecutar(partidos: list[Partido], xi: float = XI_POR_DEFECTO,
         if modelo is None:
             continue
 
+        ajuste_local = ajuste_visitante = (0.0, 0.0)
+        if ascendidos_por_temporada is not None:
+            ascendidos_temporada = ascendidos_por_temporada.get(partido.temporada, set())
+            if partido.local in ascendidos_temporada:
+                ajuste_local = correccion_ascenso
+            if partido.visitante in ascendidos_temporada:
+                ajuste_visitante = correccion_ascenso
+
         try:
             pred = modelo.predecir(partido.local, partido.visitante,
-                                   liga=partido.liga, estricto=True)
+                                   liga=partido.liga, estricto=True,
+                                   ajuste_local=ajuste_local, ajuste_visitante=ajuste_visitante)
         except KeyError:
             # Equipo recien ascendido: sin historico previo no se puede predecir.
             sin_historico += 1

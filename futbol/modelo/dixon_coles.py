@@ -34,6 +34,13 @@ Sobre eso se le anaden tres cosas:
    pocos partidos: un recien ascendido con 3 jornadas no recibe un rating
    extremo solo por una racha corta.
 
+4. Correccion de recien ascendidos: un equipo que juega su primera
+   temporada de vuelta en la liga superior tiende a rendir peor de lo que
+   su rating (basado en la liga inferior) sugiere -- medido empiricamente
+   sobre 75 casos historicos (ataque -0.043, defensa -0.063 en escala log).
+   Se aplica como ajuste en `predecir()`, no dentro del ajuste MLE -- ver
+   `futbol/modelo/ascenso.py` y CORRECCION_ASCENSO en predecir.py.
+
 Referencia: Dixon, M.J. y Coles, S.G. (1997), "Modelling Association Football
 Scores and Inefficiencies in the Football Betting Market", Applied Statistics
 46(2), 265-280.
@@ -344,13 +351,21 @@ class DixonColes:
         return float(lh), float(la)
 
     def predecir(self, local: str, visitante: str, liga: str | None = None,
-                 campo_neutral: bool = False, estricto: bool = False) -> Prediccion:
+                 campo_neutral: bool = False, estricto: bool = False,
+                 ajuste_local: tuple[float, float] = (0.0, 0.0),
+                 ajuste_visitante: tuple[float, float] = (0.0, 0.0)) -> Prediccion:
         """Predice un partido y devuelve la distribucion completa de marcadores.
 
         estricto=True exige que los nombres coincidan exactamente con los del
         dataset. Lo usa el backtest: ahi un nombre desconocido significa equipo
         sin historico, y emparejarlo por parecido con otro equipo falsearia el
         resultado.
+
+        ajuste_local/ajuste_visitante: (delta_ataque, delta_defensa) sumados
+        en escala log al rating de ese equipo antes de calcular los goles
+        esperados -- sin tocar el ajuste MLE de theta. Por defecto (0, 0):
+        sin efecto. Lo usa la correccion de recien ascendidos (ver
+        CORRECCION_ASCENSO en predecir.py y futbol/modelo/ascenso.py).
         """
         if self.ataque is None:
             raise RuntimeError("El modelo no esta ajustado: llama antes a ajustar().")
@@ -378,8 +393,11 @@ class DixonColes:
             plus_local = plus_visita = self.ventaja_local / 2
         else:
             plus_local, plus_visita = self.ventaja_local, 0.0
-        lh = float(np.exp(mu + self.ataque[i] - self.defensa[j] + plus_local))
-        la = float(np.exp(mu + self.ataque[j] - self.defensa[i] + plus_visita))
+
+        da_i, dd_i = ajuste_local        # delta ataque/defensa del local
+        da_j, dd_j = ajuste_visitante    # delta ataque/defensa del visitante
+        lh = float(np.exp(mu + (self.ataque[i] + da_i) - (self.defensa[j] + dd_j) + plus_local))
+        la = float(np.exp(mu + (self.ataque[j] + da_j) - (self.defensa[i] + dd_i) + plus_visita))
 
         n = self.max_goles + 1
         goles = np.arange(n)

@@ -3,3 +3,4 @@ __pycache__/
 .venv/
 venv/
 BD_SQLITE/*.db
+CLAUDE.md
