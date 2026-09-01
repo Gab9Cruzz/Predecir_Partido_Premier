@@ -7,7 +7,8 @@ from pathlib import Path
 
 from equipos_premier import resolver_equipo
 
-DB_PATH = Path("futbol_predicciones.db")
+# Anclado al directorio del script -- ver nota en actualizar_resultados.py.
+DB_PATH = Path(__file__).resolve().parent / "futbol_predicciones.db"
 TIMEOUT = 30  # segundos. 26 temporadas = 26 descargas; una que se cuelgue no debe trabar todo.
 
 def parsear_fecha(fecha_str):

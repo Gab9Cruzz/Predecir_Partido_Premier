@@ -1,7 +1,8 @@
 import sqlite3
 from pathlib import Path
 
-DB_PATH = Path("futbol_predicciones.db")
+# Anclado al directorio del script -- ver nota en actualizar_resultados.py.
+DB_PATH = Path(__file__).resolve().parent / "futbol_predicciones.db"
 
 DDL_SCHEMA = """
 PRAGMA foreign_keys = ON;

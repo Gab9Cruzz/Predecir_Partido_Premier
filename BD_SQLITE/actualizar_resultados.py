@@ -7,7 +7,12 @@ from pathlib import Path
 
 from equipos_premier import resolver_equipo
 
-DB_PATH = Path("futbol_predicciones.db")
+# Anclado al directorio del script (no al cwd): si se ejecuta como
+# `python .\BD_SQLITE\actualizar_resultados.py` desde la raiz del repo,
+# una ruta relativa aca abre/crea un .db vacio en la raiz en vez de usar
+# BD_SQLITE\futbol_predicciones.db -- sqlite3.connect() lo crea en
+# silencio, y el primer INSERT falla con "no such table: equipos".
+DB_PATH = Path(__file__).resolve().parent / "futbol_predicciones.db"
 TIMEOUT = 30
 
 # Temporada actual y código en football-data (Ej: 2026/2027 -> '2627')
